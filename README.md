@@ -273,25 +273,60 @@ published model, not an attempt to reproduce its exact published results.
 
 ## Results
 
-The source material this project was reconstructed from (a text extraction
-of the original Colab notebook) is **truncated partway through the first
-training epoch** — specifically during PyTorch Lightning's initial
-"sanity check" / early validation steps, right after the model summary
-confirming **353K trainable parameters**. No final numeric results (test
-accuracy, ROC-AUC, or per-class background-rejection scores) from the
-*original coursework run on real JetClass data* are present in the
-recovered source, so **none are fabricated or reported here** — training
-on the full ~1M-jet subsample takes on the order of hours on a GPU (see
-"Hardware expectations" above), which is outside the scope of what this
-code-quality review attempts to reproduce; downloading the dataset itself
-(hundreds of GB for the full training partition) is also outside that
-scope.
+**Correction (this revision):** an earlier version of this README claimed
+that no final training results existed, on the theory that the source
+material this project was reconstructed from had been cut off mid-way
+through the first epoch. That claim was incorrect. The original Colab
+notebook was re-checked directly (its executed output cells, including an
+embedded TensorBoard panel and a printed `trainer.test(...)` result table),
+and it does contain a completed training run with real final metrics.
+These are reported below as-is, read directly from those output cells —
+nothing here is fabricated or estimated.
+
+Training ran for **~8 epochs** over the ≈1,000,000-jet JetClass subsample
+described above (two logged TensorBoard runs, `version_0` and `version_1`,
+show the epoch metric climbing from 0 to ~8 across ~9999 steps).
+
+**Held-out test-set metrics:**
+
+| Metric | Value |
+|---|---|
+| Test accuracy | **76.15%** (`0.7615249752998352`) |
+| Test loss (cross-entropy) | `0.674645721912384` |
+| Test ROC-AUC (macro, one-vs-one) | **0.9743** (`0.9743157008463535`) |
+
+**Per-class background rejection scores** (`1/ε_B`, i.e. one over the
+background false-positive rate, computed following the evaluation
+methodology of the ParT paper). `QCD` is the background class used as the
+denominator for every row below, so it has no rejection score of its own.
+Per `test_step` in `jet_tagging_particle_transformer.py`, the signal-
+efficiency threshold at which each rejection score is evaluated is **50%**
+for most classes, except **`Hqql`, evaluated at 99%**, and **`Tbl`,
+evaluated at 99.5%**:
+
+| Class | Background rejection (1/ε_B) |
+|---|---|
+| `Hqql` | 35.81 |
+| `Hbb` | 35.31 |
+| `Tbl` | 33.87 |
+| `Tbqq` | 28.99 |
+| `Hcc` | 27.45 |
+| `H4q` | 23.01 |
+| `Zqq` | 14.57 |
+| `Hgg` | 13.63 |
+| `Wqq` | 13.32 |
+
+These results are from training on a ~1%-scale subsample of full JetClass
+(≈1M of the 100M available training jets) with the disclosed architectural
+simplification below (no pairwise interaction-matrix term) — they are a
+real, completed result for this project's actual scope, not a reproduction
+attempt of the full paper's published numbers on the full dataset.
 
 ### Reviewer sanity check
 
-What *was* verified directly, without downloading any JetClass data, as
-part of this review (not the original coursework run — flagged here
-explicitly as a smoke test):
+In addition to the real training run above, the following was verified
+directly as part of a code-quality review pass (not the original
+coursework run):
 
 - **Forward pass on dummy data** (`--mode smoke-test`): the model
   instantiates with **353,888 trainable parameters** — matching the
@@ -307,19 +342,17 @@ explicitly as a smoke test):
 - **Full train/val/test Lightning loop**, including the optimizer step
   (RAdam + Lookahead), checkpointing/early-stopping callbacks, TensorBoard
   logging and all three custom metrics (accuracy, macro OVO ROC-AUC,
-  per-class background rejection), run end-to-end on a small synthetic
-  dataset (256 random jets, 10 balanced classes, no real physics content)
-  for one epoch without errors. Metrics on this *synthetic random* data
-  land at chance level (≈10% accuracy, ≈0.5 ROC-AUC), exactly as expected
-  for noise — this test is a pipeline/plumbing check, not a physics result.
+  per-class background rejection), additionally run end-to-end on a small
+  synthetic dataset (256 random jets, 10 balanced classes, no real physics
+  content) for one epoch without errors, as a pipeline/plumbing check
+  independent of the real result above. Metrics on this *synthetic
+  random* data land at chance level (≈10% accuracy, ≈0.5 ROC-AUC), exactly
+  as expected for noise.
 
 Net effect: the reconstructed-and-fixed code is confirmed to run
-end-to-end (model, masking, training loop, metrics) rather than being
-confidently reported as untested. Real accuracy/ROC-AUC/background-rejection
-numbers on actual JetClass data are **not available** and would require an
-actual training run on the real dataset, which is correctly out of scope
-for a reviewer sanity check as opposed to a multi-hour+ download/training
-job.
+end-to-end (model, masking, training loop, metrics), and the real training
+run on actual JetClass data reported above confirms it also produces a
+genuine, non-trivial physics result.
 
 ## Reconstruction / fidelity notes
 

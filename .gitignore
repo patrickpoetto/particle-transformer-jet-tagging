@@ -1,0 +1,23 @@
+# Jupyter
+.ipynb_checkpoints/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Model checkpoints / weights
+*.pt
+*.pth
+*.ckpt
+
+# Data (large physics datasets, not meant to be committed)
+*.root
+*.pkl.gz
+
+# OS / editor noise
+.DS_Store
+.vscode/
+.idea/

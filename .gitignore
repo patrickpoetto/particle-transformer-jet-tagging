@@ -16,6 +16,12 @@ venv/
 # Data (large physics datasets, not meant to be committed)
 *.root
 *.pkl.gz
+/data/
+
+# Training outputs
+/logs/
+/checkpoints/
+lightning_logs/
 
 # OS / editor noise
 .DS_Store

@@ -14,10 +14,26 @@ authors rather than copied from the paper's reference code.
 ## Contents
 
 - [`jet_tagging_particle_transformer.py`](jet_tagging_particle_transformer.py) —
-  the full project: data download/exploration, feature engineering, model
-  architecture, training setup and the PyTorch Lightning training loop.
-- This README: background, dataset, architecture, training setup and known
-  results/limitations.
+  the full project as a runnable script: data download/exploration, feature
+  engineering, model architecture, training setup and the PyTorch Lightning
+  training loop, behind a small CLI (`--mode smoke-test|download-example|
+  build-dataset|train`).
+- [`requirements.txt`](requirements.txt) — pinned Python dependencies.
+- This README: background, dataset, setup, architecture, training setup and
+  known results/limitations.
+
+## Table of contents
+
+- [What is jet tagging, and why does it matter?](#what-is-jet-tagging-and-why-does-it-matter)
+- [Why a Transformer?](#why-a-transformer)
+- [Getting started](#getting-started)
+- [Dataset: JetClass](#dataset-jetclass)
+- [Feature engineering](#feature-engineering)
+- [Model architecture](#model-architecture)
+- [Training setup](#training-setup)
+- [Results](#results)
+- [Reconstruction / fidelity notes](#reconstruction--fidelity-notes)
+- [Acknowledgements](#acknowledgements)
 
 ## What is jet tagging, and why does it matter?
 
@@ -60,6 +76,87 @@ Paper: *["Particle Transformer for Jet Tagging"](https://arxiv.org/pdf/2202.0377
 Huilin Qu, Congqiao Li, Sitian Qian (arXiv:2202.03772).
 Reference implementation referenced during development:
 [`jet-universe/particle_transformer`](https://github.com/jet-universe/particle_transformer).
+
+## Getting started
+
+### Installation
+
+```bash
+git clone <this-repo-url>
+cd particle-transformer-jet-tagging
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+Requires **Python 3.9+**. `requirements.txt` pins the exact versions this
+code was verified against (see "Reviewer sanity check" below).
+
+### Quick check: does the model actually work?
+
+No dataset is needed for this — it builds the model and runs a forward pass
+on random dummy tensors of the right shape:
+
+```bash
+python jet_tagging_particle_transformer.py --mode smoke-test
+```
+
+Expected output: a parameter count (`353,888`, matching the ParT-baseline
+"~353K trainable parameters" reported in the original training log) and a
+`(batch, 10)` logits tensor. Runs on CPU in a couple of seconds.
+
+### Getting the dataset
+
+[JetClass](https://zenodo.org/records/6619768) is hosted on Zenodo. Two
+options, from smallest to largest:
+
+1. **Example file only** (100k jets, a few hundred MB) — enough to explore
+   the schema:
+   ```bash
+   python jet_tagging_particle_transformer.py --mode download-example --data-dir data/JetClass
+   ```
+2. **Full training partition** (100M jets, ~600GB total) — follow the
+   [`jet-universe/particle_transformer`](https://github.com/jet-universe/particle_transformer)
+   repo's `get_datasets.py JetClass -d <data-dir>` helper. This project does
+   **not** attempt to download that full dataset itself (see "Results"
+   below for why) — only the lightweight example file is automated here.
+
+Expected directory layout (default `--data-dir data/JetClass`):
+
+```
+data/JetClass/
+├── JetClass_example_100k.root        # from --mode download-example
+├── train_100M/*.root                 # from get_datasets.py, full training partition
+└── JetClass_subset.pkl.gz            # built by --mode build-dataset (gitignored)
+```
+
+### Building the training subset and training
+
+```bash
+# Subsample ~1/30th of the 100M-jet training partition (stratified, one file
+# in every 30, sorted) and cache it as a single compressed pickle:
+python jet_tagging_particle_transformer.py --mode build-dataset \
+    --root-glob-pattern "data/JetClass/train_100M/*.root" --stride 30
+
+# Train (add --run-test to also evaluate on the held-out test split):
+python jet_tagging_particle_transformer.py --mode train \
+    --cache-path data/JetClass/JetClass_subset.pkl.gz --epochs 15 --batch-size 512
+```
+
+Run `python jet_tagging_particle_transformer.py --help` for every option
+(data paths, batch size, epochs, learning rate, accelerator, workers, seed).
+
+### Hardware expectations
+
+- **Smoke test**: CPU-only, seconds, no GPU needed.
+- **Training**: a GPU is strongly recommended. With the full ~1M-jet
+  subsample, batch size 512 and the paper's baseline architecture
+  (`d=128`, `L=8` particle-attention blocks), the original coursework run
+  targeted a single Colab GPU (T4/P100-class); expect on the order of
+  **tens of minutes per epoch** on that class of hardware, up to 15 epochs
+  with early stopping (patience 2). CPU-only training will run (the model
+  is small, ~354K parameters) but will be considerably slower per epoch
+  given the attention over up to 128 particles x 512-sample batches.
+  `--accelerator mps` works on Apple Silicon for smaller experiments.
 
 ## Dataset: JetClass
 
@@ -181,13 +278,48 @@ of the original Colab notebook) is **truncated partway through the first
 training epoch** — specifically during PyTorch Lightning's initial
 "sanity check" / early validation steps, right after the model summary
 confirming **353K trainable parameters**. No final numeric results (test
-accuracy, ROC-AUC, or per-class background-rejection scores) are present
-in the recovered source, so **none are reported here** — in keeping with
-not inventing results that weren't in the original material. The complete
-training/evaluation pipeline (Lightning module, metrics, checkpointing,
-TensorBoard logging, `trainer.test(...)`) is implemented and included in
-the code; running it end-to-end on the full ~1M-jet dataset will produce
-these metrics.
+accuracy, ROC-AUC, or per-class background-rejection scores) from the
+*original coursework run on real JetClass data* are present in the
+recovered source, so **none are fabricated or reported here** — training
+on the full ~1M-jet subsample takes on the order of hours on a GPU (see
+"Hardware expectations" above), which is outside the scope of what this
+code-quality review attempts to reproduce; downloading the dataset itself
+(hundreds of GB for the full training partition) is also outside that
+scope.
+
+### Reviewer sanity check
+
+What *was* verified directly, without downloading any JetClass data, as
+part of this review (not the original coursework run — flagged here
+explicitly as a smoke test):
+
+- **Forward pass on dummy data** (`--mode smoke-test`): the model
+  instantiates with **353,888 trainable parameters** — matching the
+  original training log's "~353K" — and a forward pass on random tensors
+  of the correct shape (`(batch, 17, 128)` features + `(batch, 1, 128)`
+  mask) produces finite `(batch, 10)` logits.
+- **Padding mask actually has an effect**: comparing the forward pass with
+  an all-valid mask vs. a mask with half the particles marked as padding
+  gives different outputs (as it should); comparing an all-valid mask
+  against no mask at all gives *identical* outputs (also as it should).
+  This specifically confirms the `mask=None` bug fix (see below) is wired
+  correctly end-to-end, not just that it no longer crashes.
+- **Full train/val/test Lightning loop**, including the optimizer step
+  (RAdam + Lookahead), checkpointing/early-stopping callbacks, TensorBoard
+  logging and all three custom metrics (accuracy, macro OVO ROC-AUC,
+  per-class background rejection), run end-to-end on a small synthetic
+  dataset (256 random jets, 10 balanced classes, no real physics content)
+  for one epoch without errors. Metrics on this *synthetic random* data
+  land at chance level (≈10% accuracy, ≈0.5 ROC-AUC), exactly as expected
+  for noise — this test is a pipeline/plumbing check, not a physics result.
+
+Net effect: the reconstructed-and-fixed code is confirmed to run
+end-to-end (model, masking, training loop, metrics) rather than being
+confidently reported as untested. Real accuracy/ROC-AUC/background-rejection
+numbers on actual JetClass data are **not available** and would require an
+actual training run on the real dataset, which is correctly out of scope
+for a reviewer sanity check as opposed to a multi-hour+ download/training
+job.
 
 ## Reconstruction / fidelity notes
 
@@ -201,15 +333,62 @@ flagging honestly:
   metadata (the `%tensorboard` magic command) — i.e. a dump of JS/font
   binary data for offline rendering, not notebook content. Everything
   before that point — all 89 original cells — was fully recovered.
-- Two code quirks were deliberately preserved rather than "fixed", since
-  the brief was to preserve the authors' actual logic faithfully:
-  the stacked particle-attention block (`L_blocks_P_MHA`) hardcodes
-  `mask=None` internally (so the padding mask isn't applied there), and
-  `ClassAttentionBlock.forward` contains a leftover debug `print(...)`.
+- Two code quirks were deliberately preserved rather than "fixed" during
+  the initial migration, since that phase's brief was to reproduce the
+  authors' actual logic faithfully: the stacked particle-attention block
+  (`L_blocks_P_MHA`) hardcoded `mask=None` internally (so the padding mask
+  wasn't applied there), and `ClassAttentionBlock.forward` contained a
+  leftover debug `print(...)`.
 - A couple of short architecture shape-probing cells near the end of the
   notebook were run out of order in the original interactive Colab
-  session (referencing variables defined in a later cell) — preserved in
-  their original order, commented, with a note in the code.
+  session (referencing variables defined in a later cell).
+
+### Reviewer code-quality pass
+
+A later review pass (this version of the repo) explicitly fixed real bugs,
+including the two quirks above, and restructured the notebook-cell script
+into a runnable CLI. In full, kept here for transparency rather than only
+in a commit message:
+
+1. **Padding mask was never applied anywhere.** Both `L_blocks_P_MHA` and
+   `L_blocks_ClassAttentionBlock` hardcoded `mask=None` on every stacked
+   block call. Fixed to thread the mask through. Doing so correctly also
+   required fixing a second, previously-inert issue: `pf_mask` uses
+   `1 = real particle / 0 = padding`, while `nn.MultiheadAttention`'s
+   `key_padding_mask` expects the opposite (`True = ignore`). `ParT.forward`
+   now converts explicitly between the two — simply removing the
+   `mask=None` hardcoding without this would have silently masked out every
+   *real* particle instead of the padding. Verified empirically (see
+   "Reviewer sanity check" above) that the fixed mask changes model output
+   as expected, and that a fully-valid mask is equivalent to no mask.
+2. Removed the leftover debug `print(...)` in `ClassAttentionBlock.forward`.
+3. The macro one-vs-one ROC-AUC in `training_step`/`validation_step`/
+   `test_step` flattened one-hot labels and per-class probabilities into 1D
+   arrays before calling `roc_auc_score(..., multi_class="ovo")` — not the
+   API that function expects, and not a meaningful macro-OVO AUC. Fixed to
+   pass integer class labels and the (unflattened) per-class probability
+   matrix, via a small helper that also passes `labels=range(num_classes)`
+   so a mini-batch missing a class (e.g. Lightning's sanity-check batch)
+   doesn't crash the run.
+4. `test_step` called `torch.cuda.current_device()` unconditionally, which
+   raises on any non-CUDA machine (CPU, Apple Silicon/MPS). Fixed to use
+   the Lightning module's own `.device`. Likewise, unconditional
+   `torch.cuda.synchronize()` / `torch.cuda.empty_cache()` calls are now
+   guarded by `torch.cuda.is_available()`.
+5. The Colab-specific `drive.mount(...)` call and hardcoded
+   `/content/drive/...` paths are replaced with CLI arguments, and the
+   notebook's top-level statements (which executed top-to-bottom as cells,
+   including at import time) are reorganized into functions behind
+   `main()` / `if __name__ == "__main__":`, so the file is an actual
+   runnable script.
+6. Removed unused imports carried over from the notebook (`torchvision`,
+   `PIL`, `matplotlib`/`IPython` display helpers, `Axes3D`, several unused
+   stdlib modules) and the two out-of-order shape-probing cells mentioned
+   above (their content is fully covered by `--mode smoke-test`).
+
+Everything else — feature engineering, model architecture, training
+hyperparameters, overall pipeline structure — is unchanged from the
+reconstructed original.
 
 ## Acknowledgements
 

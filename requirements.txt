@@ -1,0 +1,31 @@
+# Pinned to the exact versions verified by the reviewer (Python 3.13, CPU/MPS,
+# November 2026) running `--mode smoke-test` and a full synthetic train/val/test
+# Lightning loop end-to-end (see README.md "Reviewer sanity check"). The
+# original 2023 coursework notebook ran on whatever package versions Google
+# Colab shipped at the time, which were older and are not recoverable from the
+# source material -- these pins prioritize "known to work today" reproducibility
+# over matching that unrecorded original environment.
+
+# Core deep learning stack
+torch==2.15.0
+pytorch-lightning==2.6.6
+torchmetrics==1.9.0
+tensorboard==2.21.0
+
+# ParT paper's "Ranger" optimizer = RAdam (in torch.optim) + Lookahead (timm)
+timm==1.0.31
+
+# Numerics / classical ML utilities
+numpy==2.5.5
+scikit-learn==1.9.1
+
+# JetClass data I/O (ROOT files, jagged arrays, Lorentz vectors)
+awkward==2.15.0
+uproot==5.7.7
+vector==1.9.0
+xxhash==4.1.0   # ROOT decompression codec used by some JetClass files
+lz4==4.4.5      # ROOT decompression codec used by some JetClass files
+
+# Dataset download helper
+requests==2.34.2
+tqdm==4.70.1

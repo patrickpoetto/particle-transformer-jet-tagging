@@ -25,86 +25,103 @@ very last cell (the `%tensorboard` magic command). Everything before that
 point -- all 89 original cells (37 markdown, 52 code): environment setup,
 data download/exploration, feature engineering, model definition,
 hyperparameters, Lightning training module, data loaders and the trainer
-launch -- was fully recovered and is faithfully reproduced below, including
-the authors' original comments (even a couple of rhetorical "why/what"
-notes they left themselves while reverse-engineering the paper).
+launch -- was fully recovered and is faithfully reproduced below.
 
 Because the extraction cuts off while the first training epoch is still in
 its "Sanity Checking" / early validation steps, no final numeric results
 (test accuracy, ROC-AUC, background-rejection scores) are present in the
 source. They are therefore NOT reported here or in the README -- see the
-"Results" section of the README for what is and isn't known.
+"Results" section of the README for what is and isn't known, including a
+small reviewer-run forward-pass smoke test (see `--mode smoke-test` below).
 
-Two small fidelity notes on the code itself (kept as originally written,
-not "fixed", per the reconstruction brief):
-  * In `L_blocks_P_MHA.forward`, the `mask` argument is accepted but each
-    internal block call hardcodes `mask=None`, so the attention mask is
-    effectively not applied inside the stacked particle-attention blocks.
-  * `ClassAttentionBlock.forward` contains a leftover debug `print(...)` of
-    intermediate tensor shapes.
-  * The short "sanity check" cells near the end of the notebook (shape
-    probes of Embed/MHA/Linear building blocks) were run out of order in
-    the original interactive Colab session: an early demo cell reuses
-    variables (`out0`, `cls`, ...) that are only defined in a later cell.
-    The original relative order is preserved below with a note, rather
-    than silently reordered.
+--------------------------------------------------------------------------
+REVIEWER PASS (post-migration code-quality review)
+--------------------------------------------------------------------------
+The original migration deliberately preserved two authentic quirks "as
+written" and only flagged them in comments. This later review pass fixes
+real bugs, including those two, and restructures the Colab notebook cells
+into a runnable script with a CLI. Summary of substantive changes (kept
+here rather than only in the PR description, since a reader of the code is
+exactly who needs to know what changed and why):
+
+  1. `L_blocks_P_MHA.forward` and `L_blocks_ClassAttentionBlock.forward`
+     both hardcoded `mask=None` on every internal block call, so the
+     padding mask was never actually applied anywhere in the network. This
+     is fixed below: the mask is threaded through both stacks. Doing this
+     correctly also required fixing a latent, previously-inert bug: the
+     raw `pf_mask` convention is 1 = real particle / 0 = padding, whereas
+     `nn.MultiheadAttention`'s `key_padding_mask` convention is the
+     opposite (True = ignore/pad). `ParT.forward` now converts between the
+     two explicitly instead of passing the raw mask straight through
+     (which, had the hardcoded `None`s simply been removed without this,
+     would have silently masked out every *real* particle instead of the
+     padding).
+  2. The leftover debug `print(...)` in `ClassAttentionBlock.forward` is
+     removed.
+  3. The macro one-vs-one ROC-AUC computed in `training_step` /
+     `validation_step` / `test_step` flattened the one-hot labels and the
+     per-class probabilities into 1D arrays before calling
+     `sklearn.metrics.roc_auc_score(..., multi_class="ovo")`. That is not
+     the API `multi_class="ovo"` expects (integer class labels of shape
+     `(N,)` and a 2D probability array of shape `(N, C)`); flattening both
+     turns it into a different, not-meaningful computation. Fixed to pass
+     the already-computed integer argmax labels and the unflattened
+     per-class probabilities, via a small `_macro_ovo_auc` helper that also
+     passes `labels=range(num_classes)` so a mini-batch that happens not to
+     contain every class (common during Lightning's initial "sanity check"
+     validation batches, or a small trailing batch) doesn't crash the run
+     with `ValueError: Number of classes in y_true not equal to the number
+     of columns in 'y_score'`. The original flattened computation never hit
+     this particular error, but only because flattening one-hot labels
+     degrades the calculation into a meaningless binary AUC that bypasses
+     sklearn's multiclass validation -- not because it was correct.
+  4. `test_step` called `torch.cuda.current_device()` unconditionally,
+     which raises on any machine without CUDA (e.g. CPU or Apple Silicon /
+     MPS). Fixed to use the Lightning module's own `.device`.
+  5. The Colab-specific `drive.mount(...)` call and hardcoded
+     `/content/drive/...` paths are replaced with CLI arguments (with the
+     same directory *layout* by default), and the notebook-style top-level
+     statements (which executed on import / top-to-bottom cell execution)
+     are reorganized into functions invoked from `main()`, so the file is
+     an actual runnable script rather than disconnected notebook cells.
+  6. Unused imports carried over from the notebook (torchvision, PIL,
+     matplotlib/IPython display helpers, Axes3D, several unused stdlib
+     modules) are removed.
+
+Everything else -- the feature engineering, model architecture, training
+hyperparameters and overall Lightning pipeline -- is unchanged from the
+reconstructed original.
 """
 
-# ==========================================================================
-# 0. Environment setup (Colab-specific)
-# ==========================================================================
-# Original notebook mounted Google Drive, since the JetClass data and model
-# checkpoints were stored there across sessions.
+import argparse
+import glob
+import gzip
+import os
+import pickle
 
-from google.colab import drive
-drive.mount('/content/drive')
-
-# ==========================================================================
-# 1. Dependencies
-# ==========================================================================
-# %%capture
-# Run if you have not yet run it once
-# !pip install awkward uproot vector pytorch_lightning xxhash lz4
-
-import numpy as np
 import awkward as ak
+import numpy as np
+import pytorch_lightning as pl
+import requests
+import torch
 import uproot
 import vector
-vector.register_awkward()
-
-import os
-import shutil
-import zipfile
-import tarfile
-import urllib
-import requests
-from tqdm import tqdm
-from mpl_toolkits.mplot3d import Axes3D
-
-import torch
-import torchvision
-from PIL import Image
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import train_test_split
+from timm.optim.lookahead import Lookahead
 from torch import nn
 from torch.nn import functional as F
-from torch.utils import data
-from torchvision import transforms
+from torch.optim import RAdam
+from torch.utils.data import DataLoader, Dataset
+from torchmetrics.classification import MulticlassConfusionMatrix
+from pytorch_lightning.loggers import TensorBoardLogger
+from tqdm import tqdm
 
-import collections
-import hashlib
-import math
-import random
-import re
-import sys
-import time
-from collections import defaultdict
-import pandas as pd
-from IPython import display
-from matplotlib import pyplot as plt
-from matplotlib_inline import backend_inline
+vector.register_awkward()
 
 
 # ==========================================================================
-# 2. Download & explore the JetClass example dataset
+# 1. Download & explore the JetClass example dataset
 # ==========================================================================
 def _download(url, fname, chunk_size=1024):
     """https://gist.github.com/yanqd0/c13ed29e29432e3cf3e7c38467f42f51
@@ -122,58 +139,43 @@ def _download(url, fname, chunk_size=1024):
         unit_scale=True,
         unit_divisor=1024,
     ) as bar:
-        for data in resp.iter_content(chunk_size=chunk_size):
-            size = file.write(data)
+        for chunk in resp.iter_content(chunk_size=chunk_size):
+            size = file.write(chunk)
             bar.update(size)
 
 
-# Download the small, official 100k-jet example file (used here purely for
-# exploring the schema of the dataset) if it isn't already present.
-example_file = 'JetClass_example_100k.root'
-os.chdir("/content/drive/MyDrive/JetClass/data")
-if not os.path.exists(example_file):
-    _download(
-        'https://hqu.web.cern.ch/datasets/JetClass/example/JetClass_example_100k.root',
-        example_file,
-    )
+def download_and_explore_example(data_dir):
+    """Downloads the small, official 100k-jet JetClass example file (if not
+    already present) and prints its ROOT-tree schema -- useful purely to
+    sanity-check the dataset layout before building the full training set.
+    """
+    os.makedirs(data_dir, exist_ok=True)
+    example_path = os.path.join(data_dir, 'JetClass_example_100k.root')
+    if not os.path.exists(example_path):
+        _download(
+            'https://hqu.web.cern.ch/datasets/JetClass/example/JetClass_example_100k.root',
+            example_path,
+        )
 
-# --- Exploring the file --------------------------------------------------
-# Load the content from the file
-tree = uproot.open(example_file)['tree']
+    tree = uproot.open(example_path)['tree']
+    tree.show()  # branch names / types
 
-# Display the content of the "tree" (branch names / types)
-tree.show()
-
-# tree.arrays() retrieves all the data from the tree in the ROOT file and
-# organizes it into a Python dictionary of NumPy / Awkward arrays. Each key
-# corresponds to a branch name in the ROOT file.
-table = tree.arrays()
-
-# Arrays of a scalar type (bool/int/float) can be converted to a numpy array directly, e.g.
-# table['label_QCD'].to_numpy()
-
-# Arrays of a vector type are loaded as a JaggedArray with varying elements
-# per row (number of constituent particles varies jet to jet). A JaggedArray
-# can be (zero-)padded to become a regular numpy array (see `_pad` below).
-# table['part_px']
-
-# Construct a Lorentz 4-vector from the (px, py, pz, energy) arrays. Each
-# vector represents the four-momentum of a particle (momentum along x, y, z
-# and energy), the standard way of characterising particles in HEP analyses.
-p4 = vector.zip({
-    'px': table['part_px'],
-    'py': table['part_py'],
-    'pz': table['part_pz'],
-    'energy': table['part_energy'],
-})
-
-# p4.pt / p4.eta / p4.phi derive the transverse momentum, pseudorapidity and
-# azimuthal angle of each particle from the 4-vector.
-# p4.pt, p4.eta, p4.phi
+    table = tree.arrays()
+    # Construct a Lorentz 4-vector from (px, py, pz, energy): the standard
+    # way of characterising a particle's kinematics in HEP analyses.
+    p4 = vector.zip({
+        'px': table['part_px'],
+        'py': table['part_py'],
+        'pz': table['part_pz'],
+        'energy': table['part_energy'],
+    })
+    print(f"Loaded {len(table)} jets from {example_path}")
+    print(f"Example derived kinematics (first jet): pt={p4.pt[0][:5]}, "
+          f"eta={p4.eta[0][:5]}, phi={p4.phi[0][:5]}")
 
 
 # ==========================================================================
-# 3. Feature engineering: padding, clipping, and building model inputs
+# 2. Feature engineering: padding, clipping, and building model inputs
 # ==========================================================================
 def _pad(a, maxlen, value=0, dtype='float32'):
     """Pads (or truncates) arrays or arrays-within-arrays to a fixed length `maxlen`.
@@ -207,10 +209,6 @@ def _pad(a, maxlen, value=0, dtype='float32'):
         return x
 
 
-# Apply zero-padding and convert to a numpy array, e.g.:
-# _pad(p4.pt, maxlen=128).to_numpy()
-
-
 def _clip(a, a_min, a_max):
     """Clips array values to the [a_min, a_max] range.
 
@@ -225,7 +223,7 @@ def _clip(a, a_min, a_max):
         return ak.unflatten(np.clip(ak.flatten(a), a_min, a_max), ak.num(a))
 
 
-def build_features_and_labels(a, transform_features=True):
+def build_features_and_labels(a, max_particles=128, transform_features=True):
     """Builds the (points, features, vectors, mask) input tensors and the
     one-hot label tensor expected by the Particle Transformer, following the
     feature construction described in the ParT paper / reference repo
@@ -239,17 +237,11 @@ def build_features_and_labels(a, transform_features=True):
       - Standardize a subset of those features (if `transform_features`)
         using fixed shift/scale constants taken from the reference
         implementation.
-      - Pad every per-particle feature to a fixed `maxlen=128` constituents
+      - Pad every per-particle feature to a fixed `max_particles` constituents
         per jet and stack them into `pf_points`, `pf_features`, `pf_vectors`
         and `pf_mask` arrays.
       - Stack the 10 one-hot class labels into a single `label` array.
     """
-    # load arrays from the tree, where * stand for all of the filters that contains
-    # what is before the *
-
-    # remove comment when 100k example
-    # a = tree.arrays(filter_name=['part_*', 'jet_pt', 'jet_energy', 'label_*'])
-
     # compute new features
     a['part_mask'] = ak.ones_like(a['part_energy'])
     a['part_pt'] = np.hypot(a['part_px'], a['part_py'])
@@ -275,9 +267,8 @@ def build_features_and_labels(a, transform_features=True):
     feature_list = {
         'pf_points': ['part_deta', 'part_dphi'],  # not used in ParT
         'pf_features': [
-            # Kinematics: part_pt includes the momentum except pz (WHY PZ NOT COMPUTED ABOVE??)
-            # the rest are kinematics that can be computed given the pf_vectors
-            # measured in units of GeV (WHAT???)
+            # Kinematics (measured in GeV): pt, energy and their jet-relative
+            # log versions, plus the angular distance to the jet axis.
             'part_pt_log',
             'part_e_log',
             'part_logptrel',
@@ -285,26 +276,24 @@ def build_features_and_labels(a, transform_features=True):
             'part_deltaR',
             'part_charge',
 
-            # 5 class onehot encoding of the particle identification (value +-1).
-            # Also, it takes into consideration the particle identity determined by
-            # the detector system
+            # 5-class one-hot encoding of the particle identity (+-1),
+            # as determined by the detector's particle-flow reconstruction.
             'part_isChargedHadron',
             'part_isNeutralHadron',
             'part_isPhoton',
             'part_isElectron',
             'part_isMuon',
 
-            # values and errors of the transverse and the longitudinal impact
-            # parameters of the particle trajectories in units of mm
-            # These values are only present for charged particles, the neutral ones
-            # are assigned 0
+            # Values and errors of the transverse and longitudinal impact
+            # parameters of the particle trajectories, in mm. Only defined
+            # for charged particles; neutral particles get 0.
             'part_d0',
             'part_d0err',
             'part_dz',
             'part_dzerr',
 
-            # Explanation: Pseudorapidity and azimuthal angle
-            # difference between the particle and jet.
+            # Pseudorapidity / azimuthal-angle difference between the
+            # particle and the jet axis.
             'part_deta',
             'part_dphi',
         ],
@@ -320,7 +309,7 @@ def build_features_and_labels(a, transform_features=True):
     # Create the dictionary that will be the output of the function
     out = {}
     for k, names in feature_list.items():
-        out[k] = np.stack([_pad(a[n], maxlen=128).to_numpy() for n in names], axis=1)
+        out[k] = np.stack([_pad(a[n], maxlen=max_particles).to_numpy() for n in names], axis=1)
 
     label_list = ['label_Hbb', 'label_Hcc', 'label_Hgg', 'label_H4q', 'label_Hqql',
                   'label_Tbqq', 'label_Tbl', 'label_Zqq', 'label_Wqq', 'label_QCD']
@@ -330,82 +319,77 @@ def build_features_and_labels(a, transform_features=True):
 
 
 # ==========================================================================
-# 4. Building the full training dataset (~1M jets)
+# 3. Building the full training dataset (~1M jets) from raw ROOT files
 # ==========================================================================
-# We've imported the Git repository containing the dataset, which comprises
-# batches with 10 million observations. Each batch consists of 10 files per
-# class (10 classes), with each file containing 100,000 observations. Due to
-# various challenges, we opted to work with 1 million observations, ensuring
-# data integrity and avoiding potential issues. To maintain an unbiased
-# model, we carefully selected one batch, encompassing 100,000 observations,
-# from each distinct class.
+# The full JetClass training partition is 100M jets, split across many
+# per-class ROOT files (see https://github.com/jet-universe/particle_transformer
+# `get_datasets.py` for how to download it). For this project, to keep
+# things tractable on Colab while remaining representative of the full
+# dataset, a stratified subsample was taken: one file in every `stride`
+# (sorted, so the subsample is reproducible), evenly covering all 10
+# classes.
+def build_training_dataset(root_glob_pattern, cache_path, stride=30, max_particles=128):
+    """Globs ROOT files matching `root_glob_pattern`, subsamples every
+    `stride`-th file (sorted for reproducibility), builds the
+    (features, labels, mask, ...) arrays via `build_features_and_labels`,
+    and caches the result as a gzip-compressed pickle at `cache_path`.
 
-# !git clone https://github.com/jet-universe/particle_transformer.git
+    Requires the raw JetClass ROOT files to already be present locally
+    (see README.md for how to obtain them) -- this function does not
+    download the full (multi-hundred-GB) dataset itself.
+    """
+    file_list = sorted(glob.glob(root_glob_pattern))
+    if not file_list:
+        raise FileNotFoundError(
+            f"No ROOT files matched '{root_glob_pattern}'. Download the JetClass "
+            "training partition first (see README.md 'Getting the dataset')."
+        )
+    file_list = file_list[::stride]
+    print(f"Building training dataset from {len(file_list)} files "
+          f"(stride={stride}) matching '{root_glob_pattern}'")
 
-# os.chdir("/content/particle_transformer")
-# !/content/particle_transformer/get_datasets.py JetClass -d "/content/drive/MyDrive/JetClass/data"
+    trees = ak.concatenate([
+        uproot.open(file)["tree"].arrays(filter_name=['part_*', 'jet_pt', 'jet_energy', 'label_*'])
+        for file in file_list
+    ])
 
-import glob
+    dataset = build_features_and_labels(trees, max_particles=max_particles)
 
-file_pattern = "/content/drive/MyDrive/JetClass/data/JetClass/Pythia/train_100M/*.root"
-
-# glob to find all files matching the pattern in a specific directory
-file_list = sorted(glob.glob(file_pattern))  # sort to ensure it maintains the order in the folder
-file_list = file_list[::30]  # 1M, add + file_list[1::30] for 2 Million
-
-# from tree to array, then concatenate all of them with ak
-trees = ak.concatenate([
-    uproot.open(file)["tree"].arrays(filter_name=['part_*', 'jet_pt', 'jet_energy', 'label_*'])
-    for file in file_list
-])
-
-data = build_features_and_labels(trees)
-
-# use pickle together with gzip to reduce the dimension of big file and write in the drive
-import pickle
-import gzip
-
-file_path = '/content/drive/MyDrive/JetClass/data/JetC_1M.pkl.gz'
-# Compress and save the dictionary
-with gzip.open(file_path, 'wb') as file:
-    pickle.dump(data, file)
+    os.makedirs(os.path.dirname(cache_path) or '.', exist_ok=True)
+    with gzip.open(cache_path, 'wb') as f:
+        pickle.dump(dataset, f)
+    print(f"Wrote {cache_path} ({sum(v.nbytes for v in dataset.values()) / 1e6:.1f} MB uncompressed)")
+    return dataset
 
 
-# ==========================================================================
-# 5. Load dataset and split into train / validation / test
-# ==========================================================================
-# use pickle together with gzip to read big files stored previously in the drive
-file_path = '/content/drive/MyDrive/JetClass/data/JetC_1M.pkl.gz'
+def load_dataset_splits(cache_path, seed=42):
+    """Loads the cached (features, labels, mask) dataset built by
+    `build_training_dataset` and splits it 64% train / 16% val / 20% test
+    (an 80/20 split, then an 80/20 split of the training portion).
+    """
+    with gzip.open(cache_path, 'rb') as f:
+        dataset = pickle.load(f)
 
-# Retrieve the compressed dictionary
-with gzip.open(file_path, 'rb') as file:
-    data = pickle.load(file)
+    labels = torch.as_tensor(dataset["label"], dtype=torch.long)
+    features = torch.from_numpy(dataset["pf_features"])
+    mask = torch.from_numpy(dataset["pf_mask"])
 
-df = data.copy()
+    X_train, X_test, y_train, y_test, train_mask, test_mask = train_test_split(
+        features, labels, mask, test_size=0.2, train_size=0.8, random_state=seed)
+    X_train, X_val, y_train, y_val, train_mask, val_mask = train_test_split(
+        X_train, y_train, train_mask, test_size=0.2, train_size=0.8, random_state=seed)
 
-# from the imported dictionary store all the important variables in different variables
-labels = torch.from_numpy(df["label"])
-features = torch.from_numpy(df["pf_features"])
-mask = torch.from_numpy(df["pf_mask"])
-momentums_energy = torch.from_numpy(df["pf_vectors"])
-pf_points = torch.from_numpy(df["pf_points"])
+    assert train_mask.shape[0] == X_train.shape[0] == y_train.shape[0]
 
-labels = torch.tensor(labels, dtype=torch.long)
-
-# Create train, test and val. We achieve it by first splitting train and testing
-# then we split the train to obtain train and validation
-from sklearn.model_selection import train_test_split
-
-X_train, X_test, y_train, y_test, train_mask, test_mask = train_test_split(
-    features, labels, mask, test_size=0.2, train_size=0.8, random_state=42)
-X_train, X_val, y_train, y_val, train_mask, val_mask = train_test_split(
-    X_train, y_train, train_mask, test_size=0.2, train_size=0.8, random_state=42)
-
-assert train_mask.shape[0] == X_train.shape[0] == y_train.shape[0]
+    return {
+        "train": (X_train, y_train, train_mask),
+        "val": (X_val, y_val, val_mask),
+        "test": (X_test, y_test, test_mask),
+    }
 
 
 # ==========================================================================
-# 6. Model architecture: Particle Transformer (ParT)
+# 4. Model architecture: Particle Transformer (ParT)
 # ==========================================================================
 # Building blocks used below:
 #   - BatchNorm1d / LayerNorm for feature normalization
@@ -487,7 +471,10 @@ class P_MHA(nn.Module):
         )
 
     def forward(self, x, mask=None):
-        # Change to (batch_size, seq_len, input_size)
+        # x: (batch_size, seq_len, input_size)
+        # `mask` is a boolean key_padding_mask (True = padding, ignored by
+        # attention), shape (batch_size, seq_len) -- see ParT.forward for
+        # where it's derived from the raw per-particle pf_mask.
 
         # Layer normalization at the start
         x_norm = self.LN1(x)
@@ -508,17 +495,15 @@ class P_MHA(nn.Module):
 
 
 class L_blocks_P_MHA(P_MHA):
-    """Stacks `L_blocks` particle-attention blocks, as in the paper's L=8 baseline.
-
-    NOTE (kept as originally written): `mask` is accepted as an argument but
-    each internal call below hardcodes `mask=None`, so the padding mask is
-    not actually applied inside the stacked particle-attention blocks.
-    """
+    """Stacks `L_blocks` particle-attention blocks, as in the paper's L=8 baseline."""
 
     def forward(self, x, L_blocks=8, mask=None):
+        # Reviewer fix: this used to hardcode `mask=None` on every block
+        # call below, so the padding mask was silently never applied here.
+        # `mask` is now threaded through every stacked block.
         x_i = x
         for i in range(L_blocks):
-            new_x = super().forward(x_i, mask=None)
+            new_x = super().forward(x_i, mask=mask)
             x_i = new_x
         return new_x
 
@@ -544,7 +529,10 @@ class ClassAttentionBlock(nn.Module):
         )
 
     def forward(self, x, x_cls=None, mask=None):
-        # Change to (batch_size, seq_len, input_size)
+        # x: (batch_size, seq_len, input_size)
+        # `mask`: boolean key_padding_mask over the seq_len particle tokens
+        # (True = padding). The class token itself is never padding, so a
+        # `False` column is prepended for it before it's passed to `mha`.
 
         # Expand class token to match the batch size and sequence length
         if x_cls is None:
@@ -556,17 +544,22 @@ class ClassAttentionBlock(nn.Module):
 
         x_with_token = self.LN1(x_with_token)
 
+        if mask is not None:
+            cls_token_mask = torch.zeros(mask.size(0), 1, dtype=torch.bool, device=mask.device)
+            mask_with_token = torch.cat((cls_token_mask, mask), dim=1)
+        else:
+            mask_with_token = None
+
         # Calculate attention using Multihead Attention: the class token is
         # the query, the (class token + particles) sequence is key/value.
         attn_output, _ = self.mha(class_token, x_with_token, x_with_token,
-                                   key_padding_mask=mask)
+                                   key_padding_mask=mask_with_token)
 
         output = self.LN2(attn_output)
 
         output_sum = class_token + output
 
         linear_out = self.linear(output_sum)
-        print(x_with_token.shape, attn_output.shape, output.shape)  # leftover debug print (kept as-is)
         # Return attention output
         return linear_out + output_sum
 
@@ -575,9 +568,11 @@ class L_blocks_ClassAttentionBlock(ClassAttentionBlock):
     """Stacks `L_blocks` class-attention blocks (the paper's baseline uses 2)."""
 
     def forward(self, x, L_blocks=2, x_cls=None, mask=None):
+        # Reviewer fix: same hardcoded-`mask=None` issue as L_blocks_P_MHA,
+        # fixed the same way.
         x_i_cls = None
         for i in range(L_blocks):
-            new_x_cls = super().forward(x, x_cls=x_i_cls, mask=None)
+            new_x_cls = super().forward(x, x_cls=x_i_cls, mask=mask)
             x_i_cls = new_x_cls
         return new_x_cls
 
@@ -638,7 +633,9 @@ class ParT(nn.Module):
                  attn_dropout_pmha=0.1,
                  dropout_pmha=0.1,
                  activation='gelu',
-                 for_inf_final=False):
+                 for_inf_final=False,
+                 num_pmha_blocks=8,
+                 num_cls_blocks=2):
 
         super().__init__()
 
@@ -649,136 +646,38 @@ class ParT(nn.Module):
         self.cls = L_blocks_ClassAttentionBlock(input_size_cls,
                                                  num_heads_cls, linear_size_cls)
         self.final = Final(input_size_final, dims_final, for_inf=for_inf_final)
+        # Exposed so the depth can be tuned without touching the block
+        # classes; defaults (8, 2) match the paper's baseline, as before.
+        self.num_pmha_blocks = num_pmha_blocks
+        self.num_cls_blocks = num_cls_blocks
 
     def forward(self, x, mask=None, x_cls=None):
+        # `mask`: the raw per-particle pf_mask, shape (batch, 1, seq_len),
+        # with 1 = real particle / 0 = padding (as produced by
+        # `build_features_and_labels`). `nn.MultiheadAttention` expects the
+        # opposite convention for `key_padding_mask` (True = ignore), so it
+        # is inverted (and squeezed to (batch, seq_len)) here, once, before
+        # being passed down to the attention blocks.
+        key_padding_mask = None
+        if mask is not None:
+            key_padding_mask = mask.reshape(mask.size(0), -1) == 0
+
         emb_out = self.emb(x)
-        pmha_out = self.pmha(emb_out, mask=mask)
-        cls_out = self.cls(pmha_out, mask=mask, x_cls=x_cls)
-        output_sm = self.final(cls_out)
+        pmha_out = self.pmha(emb_out, L_blocks=self.num_pmha_blocks, mask=key_padding_mask)
+        cls_out = self.cls(pmha_out, L_blocks=self.num_cls_blocks, mask=key_padding_mask, x_cls=x_cls)
+        output = self.final(cls_out)
 
-        return output_sm
-
-
-# ==========================================================================
-# 7. Hyperparameters
-# ==========================================================================
-# Taken from the ParT paper's baseline configuration (L=8 particle-attention
-# blocks, 2 class-attention blocks, embedding dim d=128 via a 3-layer MLP
-# with (128, 512, 128) nodes, 8 attention heads, dropout 0.1 on particle
-# attention blocks, cross-entropy loss, RAdam + Lookahead optimizer,
-# batch size 512):
-#
-#   "The baseline ParT model has a total of L = 8 particle attention blocks
-#   and 2 class attention blocks. It uses a particle embedding of dimension
-#   d = 128, encoded from the input particle features using a 3-layer MLP
-#   with (128, 512, 128) nodes each layer with GELU nonlinearity [...] The
-#   P-MHA (MHA) in the particle (class) attention blocks all have 8 heads
-#   [...] We use a dropout of 0.1 for all particle attention blocks, and no
-#   dropout for the class attention block."
-#
-#   "The training is performed on the full training set of 100M jets. We
-#   employ the Lookahead optimizer (Zhang et al., 2019) with k=6 and
-#   alpha=0.5 to minimize the cross-entropy loss, and the inner optimizer is
-#   RAdam (Liu et al., 2020) with beta1=0.95, beta2=0.999, eps=1e-5. A batch
-#   size of 512 and an initial learning rate (LR) of 0.001 are used."
-
-TRAIN_BATCH_SIZE = 512
-VALID_BATCH_SIZE = 512
-TEST_BATCH_SIZE = 512
-
-EPOCHS = 15
-
-MAX_GRAD_NORM = 10
-
-log_dir = "/content/drive/MyDrive/JetClass/logs"
-
-input_dim_emb = 17
-dims_emb = [128, 512, 128]
-
-input_size_pmha = 128
-num_heads_pmha = 8
-linear_size_pmha = 128
-
-input_size_cls = 128
-num_heads_cls = 8
-linear_size_cls = 128
-
-input_size_final = 128
-dims_final = [100, 50, 10]  # 10 output classes
+        return output
 
 
 # ==========================================================================
-# 8. Sanity-check forward pass through each block
+# 5. Lightning module: training / validation / test steps
 # ==========================================================================
-# NOTE on fidelity: the following shape-probing cells were run out of order
-# in the original interactive Colab session -- this first probe reuses
-# `out0` / `cls` which are only produced by the model-instantiation cell
-# further below. Kept in the original relative order rather than silently
-# reordered; run the "model0 = Embed(...)" block below first if executing
-# this file top-to-bottom end-to-end.
-#
-# ln = nn.LayerNorm(128)
-# b = nn.BatchNorm1d(128)
-# ln_o = ln(out0)
-# ln_b = b(out0)
-# print(ln_o.shape)
-# mha = nn.MultiheadAttention(128, 8, batch_first=True)
-# mha_o, _ = mha(cls, ln_o, ln_o)
-# print(mha_o.shape)
-# ln2 = ln(mha_o)
-# print(ln2.shape)
-# lin = nn.Linear(128, 100)
-# lin_o = lin(ln2)
-# print(lin_o.shape)
-#
-# class_token = nn.Parameter(torch.zeros(1, 1, 128), requires_grad=True)
-# cls = class_token.expand(X_train[0:100].size(0), -1, -1)
-# x_with_token = torch.cat((cls, out1[0:100]), dim=1)
-# ln_cls = ln(x_with_token)
-# mha_cls, _ = mha(cls, ln_cls, ln_cls)
-# ln_cls.shape            # -> torch.Size([100, 129, 128])
-
-model0 = Embed(input_dim_emb, dims_emb)
-out0 = model0(X_train[0:100])
-print(out0.shape)
-
-model1 = L_blocks_P_MHA(input_size_pmha, num_heads_pmha, linear_size_pmha)
-out1 = model1(out0, mask=train_mask[0:100])
-print(out1.shape)
-
-model2 = L_blocks_ClassAttentionBlock(input_size_cls, num_heads_cls, linear_size_cls)
-out2 = model2(out1, mask=train_mask[0:100])
-print(out2.shape)
-
-model3 = Final(input_size_final, dims_final)
-out3 = model3(out2)
-print(out3.shape)
-
-model = ParT(input_dim_emb=input_dim_emb,
-             dims_emb=dims_emb,
-
-             input_size_pmha=input_size_pmha,
-             num_heads_pmha=num_heads_pmha,
-             linear_size_pmha=linear_size_pmha,
-
-             input_size_cls=input_size_cls,
-             num_heads_cls=num_heads_cls,
-             linear_size_cls=linear_size_cls,
-
-             input_size_final=input_size_final,
-             dims_final=dims_final)
-
-
-# ==========================================================================
-# 9. Training and testing (PyTorch Lightning)
-# ==========================================================================
-# In order to implement the phases of training, validation and testing we
-# used PyTorch Lightning. The training/validation steps compute loss,
-# accuracy and the (macro, one-vs-one) ROC-AUC, logging them per step/epoch.
-# The test step additionally computes, per signal class, the background
-# rejection (1 / false-positive-rate) at the signal-efficiency threshold
-# used by the ParT paper for that class. A TensorBoard logger is used to
-# track and visualize all metrics during training.
+# The training/validation steps compute loss, accuracy and the (macro,
+# one-vs-one) ROC-AUC, logging them per step/epoch. The test step
+# additionally computes, per signal class, the background rejection
+# (1 / false-positive-rate) at the signal-efficiency threshold used by the
+# ParT paper for that class. A TensorBoard logger tracks all metrics.
 #
 # Metrics (see README for the full explanation):
 #   - Accuracy and macro AUC-ROC: overall multi-class discrimination.
@@ -786,70 +685,68 @@ model = ParT(input_dim_emb=input_dim_emb,
 #         Rej_X% = 1 / FPR  at TPR = X%
 #     an HEP-specific metric measuring how well the background (QCD) class
 #     is rejected at a fixed true-positive rate for each signal class.
+def _macro_ovo_auc(y_true, probabilities, num_classes):
+    """Macro one-vs-one ROC-AUC, robust to a batch not containing every
+    class (e.g. the first sanity-check mini-batch, or a small/uneven last
+    batch): `labels=range(num_classes)` tells sklearn the score matrix has
+    `num_classes` columns regardless of how many are actually present in
+    `y_true` for this particular batch, instead of raising
+    `ValueError: Number of classes in y_true not equal to the number of
+    columns in 'y_score'`. If a batch is so degenerate it has only one
+    class present at all, this returns NaN (mathematically undefined AUC)
+    rather than crashing.
+    """
+    return roc_auc_score(y_true, probabilities, average="macro", multi_class="ovo",
+                          labels=list(range(num_classes)))
 
-import pytorch_lightning as pl
-from torch.optim import RAdam
-from sklearn.metrics import roc_auc_score
-from timm.optim.lookahead import Lookahead
-from pytorch_lightning.loggers import TensorBoardLogger
-from sklearn.metrics import accuracy_score
-from torchmetrics.classification import MulticlassConfusionMatrix
 
+class JetTaggingLightningModule(pl.LightningModule):
+    """PyTorch Lightning wrapper around `ParT` implementing the train/val/test
+    loops, metric logging and the Ranger-equivalent (RAdam + Lookahead)
+    optimizer used in the ParT paper.
+    """
 
-class LightiningTrainVal(pl.LightningModule):
-    def __init__(self, model):
+    def __init__(self, model, log_dir, lr=1e-3):
         super().__init__()
         self.model = model
-        self.logg = TensorBoardLogger(log_dir, name="lightning_logs")
+        self.lr = lr
+        self.tb_logger = TensorBoardLogger(log_dir, name="lightning_logs")
 
     def forward(self, x, mask=None):
         return self.model(x, mask=mask)
 
     def training_step(self, batch, batch_idx):
-        x, y, mask = batch  # Preprocess batch data
+        x, y, mask = batch
 
-        # Forward pass
         logits = self.forward(x, mask)
-
-        # Calculate loss
         loss = F.cross_entropy(logits, y.float())
         self.log('train_loss', loss, prog_bar=True, on_epoch=True)
 
-        # Calculate accuracy
         logits_argmax = torch.argmax(logits, dim=1)
         y_argmax = torch.argmax(y, dim=1)
         acc = (logits_argmax == y_argmax).float().mean()
         self.log('train_acc', acc, prog_bar=True, on_epoch=True)
 
-        # Calculate AUC ROC
-        logits_cpu = logits.detach().cpu().numpy()
-        y_cpu = y.detach().cpu().numpy()
-        logits_softmax = torch.softmax(torch.from_numpy(logits_cpu), dim=1).cpu().numpy()
-        auc = roc_auc_score(y_cpu.flatten(), logits_softmax.flatten(), average="macro", multi_class="ovo")
+        probabilities = torch.softmax(logits, dim=1).detach().cpu().numpy()
+        auc = _macro_ovo_auc(y_argmax.detach().cpu().numpy(), probabilities, logits.shape[1])
         self.log('train_auc', auc, prog_bar=True, on_epoch=True)
 
         return loss
 
     def validation_step(self, batch, batch_idx):
-        x, y, mask = batch  # Assuming mask is included in your dataset
+        x, y, mask = batch
 
         logits = self.forward(x, mask).float()
         loss = F.cross_entropy(logits, y.float())
-        self.log('val_loss', loss, prog_bar=True, on_epoch=True)  # Logging the validation loss
+        self.log('val_loss', loss, prog_bar=True, on_epoch=True)
 
-        # Calculate training accuracy
         logits_argmax = torch.argmax(logits, dim=1)
         y_argmax = torch.argmax(y, dim=1)
         acc = (logits_argmax == y_argmax).float().mean()
         self.log('val_acc', acc, prog_bar=True, on_epoch=True)
 
-        # Calculate AUC score
-        logits_cpu = logits.detach().cpu().numpy()
-        y_cpu = y.detach().cpu().numpy()
-
-        probabilities = torch.softmax(torch.from_numpy(logits_cpu), dim=1).numpy()
-
-        roc = roc_auc_score(y_cpu.flatten(), probabilities.flatten(), average="macro", multi_class="ovo")
+        probabilities = torch.softmax(logits, dim=1).detach().cpu().numpy()
+        roc = _macro_ovo_auc(y_argmax.detach().cpu().numpy(), probabilities, logits.shape[1])
         self.log('val_auc', roc, prog_bar=True, on_epoch=True)
 
         return loss
@@ -860,9 +757,8 @@ class LightiningTrainVal(pl.LightningModule):
         y_true_argm = torch.argmax(y, dim=1)
         logits = self.forward(x, mask)
         logits_argm = torch.argmax(logits, dim=1)
-        device = torch.cuda.current_device()
 
-        metric = MulticlassConfusionMatrix(num_classes=10).to(device)
+        metric = MulticlassConfusionMatrix(num_classes=10).to(self.device)
         cm = metric(logits, y_true_argm)
 
         label_list = ['Hbb', 'Hcc', 'Hgg', 'H4q', 'Hqql', 'Tbqq', 'Tbl', 'Zqq', 'Wqq']
@@ -871,41 +767,27 @@ class LightiningTrainVal(pl.LightningModule):
         for i in range(9):
             signal_class = i
             background_class = 9
-            # Get confusion matrix values for signal and background classes
             tp = cm[signal_class][signal_class]
             fp = cm[background_class][signal_class]
             tn = cm[background_class][background_class]
             fn = cm[signal_class][background_class]
 
-            # Calculate False Positive Rate (FPR)
             fpr = fp / (fp + tn)
-
-            # Calculate Signal Efficiency (SE)
             se = tp / (tp + fn)
 
-            # Calculate Background Rejection at the target Signal Efficiency
             signal_efficiency_threshold = signal_efficiency_thresholds[i]
-            if se >= signal_efficiency_threshold and torch.isnan(fpr) == False:
+            if se >= signal_efficiency_threshold and not torch.isnan(fpr):
                 background_rejection = 1 / fpr
-                if torch.isinf(background_rejection) == False:
+                if not torch.isinf(background_rejection):
                     self.log(f'test_rejection_score_{label_list[i]}', background_rejection, on_epoch=True)
-            else:
-                background_rejection = 0  # Signal efficiency is below the desired threshold
 
-        # Compute loss
         loss = F.cross_entropy(logits, y.float())
-
-        # compute accuracy
         acc = (logits_argm == y_true_argm).float().mean()
 
-        logits_cpu = logits.detach().cpu().numpy()
-        y_cpu = y.detach().cpu().numpy()
+        probabilities = torch.softmax(logits, dim=1).detach().cpu().numpy()
+        roc = _macro_ovo_auc(y_true_argm.detach().cpu().numpy(), probabilities, logits.shape[1])
 
-        probabilities = torch.softmax(torch.from_numpy(logits_cpu), dim=1).numpy()
-
-        roc = roc_auc_score(y_cpu.flatten(), probabilities.flatten(), average="macro", multi_class="ovo")
-
-        self.log('test_loss', loss, prog_bar=True, on_epoch=True)  # Logging the test loss
+        self.log('test_loss', loss, prog_bar=True, on_epoch=True)
         self.log('test_acc', acc, prog_bar=True, on_epoch=True)
         self.log('test_roc', roc, prog_bar=True, on_epoch=True)
         return loss
@@ -915,91 +797,211 @@ class LightiningTrainVal(pl.LightningModule):
         # the ParT paper. RAdam rectifies the adaptive learning rate's
         # variance early in training; Lookahead keeps a slow set of weights
         # updated from k fast-optimizer steps, for more stable convergence.
-        inn_optimizer = RAdam(self.parameters(), lr=1e-3, betas=(0.95, 0.999), eps=1e-05)
+        inn_optimizer = RAdam(self.parameters(), lr=self.lr, betas=(0.95, 0.999), eps=1e-05)
         optimizer = Lookahead(inn_optimizer, alpha=0.5, k=6)
         return optimizer
 
-    # Other methods as needed for Lightning functionality
 
-
-light_model = LightiningTrainVal(model)
-
-
-# --- Data loaders ---------------------------------------------------------
-# Shuffling training data helps prevent any unintentional bias that could
-# arise from the ordering of samples. Validation data is NOT shuffled, so
-# evaluation is performed on samples in their original order.
-from torch.utils.data import Dataset
-
-
-class CustomDataset(Dataset):
-    """Wraps (features, labels, mask) arrays into a PyTorch Dataset so they
+class JetTensorDataset(Dataset):
+    """Wraps (features, labels, mask) tensors into a PyTorch Dataset so they
     can be consumed by a standard DataLoader.
     """
 
-    def __init__(self, a, b, c):
-        self.a = a
-        self.b = b
-        self.c = c
+    def __init__(self, features, labels, mask):
+        self.features = features
+        self.labels = labels
+        self.mask = mask
 
     def __len__(self):
-        return len(self.a)
+        return len(self.features)
 
     def __getitem__(self, idx):
-        return self.a[idx], self.b[idx], self.c[idx]
-        # return {"a": self.a[idx], "b": self.b[idx], "c": self.c[idx]}
+        return self.features[idx], self.labels[idx], self.mask[idx]
 
 
-train_data_ = CustomDataset(X_train, y_train, train_mask)
-val_data_ = CustomDataset(X_val, y_val, val_mask)
-test_data_ = CustomDataset(X_test, y_test, test_mask)
+# ==========================================================================
+# 6. Model construction helper + forward-pass smoke test
+# ==========================================================================
+def build_model(input_dim=17, num_classes=10):
+    """Constructs a `ParT` model with the ParT paper's baseline
+    hyperparameters (d=128 embedding, L=8 particle-attention blocks, L=2
+    class-attention blocks, 8 heads, dropout 0.1), as used throughout this
+    project. Unlike CNNs/RNNs, attention has no fixed sequence-length
+    dependence baked into its weights, so the number of particles per jet
+    (`--max-particles`) does not affect the model's parameter shapes.
+    """
+    return ParT(
+        input_dim_emb=input_dim,
+        dims_emb=[128, 512, 128],
 
-# Create the DataLoader objects for features, labels and mask
-train_dataloader = torch.utils.data.DataLoader(train_data_, TRAIN_BATCH_SIZE, shuffle=True, num_workers=11)
-val_dataloader = torch.utils.data.DataLoader(val_data_, VALID_BATCH_SIZE, shuffle=False, num_workers=7)
-test_dataloader = torch.utils.data.DataLoader(test_data_, TEST_BATCH_SIZE, shuffle=False, num_workers=0)
+        input_size_pmha=128,
+        num_heads_pmha=8,
+        linear_size_pmha=128,
 
-torch.cuda.synchronize()
-torch.cuda.empty_cache()
+        input_size_cls=128,
+        num_heads_cls=8,
+        linear_size_cls=128,
 
-# !rm -rf /content/drive/MyDrive/JetClass/logs/lightning_logs
-# %reload_ext tensorboard
+        input_size_final=128,
+        dims_final=[100, 50, num_classes],
+    )
 
 
-# --- Trainer: checkpointing + early stopping ------------------------------
-# At this point we have everything ready to create our trainer. We decided
-# to include checkpoints and early stopping criteria as callbacks, the
-# former to save and reuse the model in successive runs if necessary, and
-# the latter to avoid overfitting.
+def run_smoke_test(max_particles=128, input_dim=17, num_classes=10, batch_size=4, device=None):
+    """Instantiates the model and runs a forward pass on random dummy
+    tensors of the right shape, with no dataset required. This does not
+    validate numerical correctness against any reference, but does verify
+    that the model builds and a forward pass through every block (Embed,
+    particle attention, class attention, classification head) runs without
+    shape/dtype errors -- useful as a fast, dependency-light check that the
+    reconstructed/fixed code actually works end-to-end.
+    """
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    model = build_model(input_dim=input_dim, num_classes=num_classes).to(device)
+    model.eval()
 
-### FINAL VERSION AFTER BEST TUNED PARAMETERS ###
+    x = torch.randn(batch_size, input_dim, max_particles, device=device)
+    # Random 0/1 mask with ~70% real particles, 30% padding -- shape and
+    # convention matching the real pf_mask (1 = real particle, 0 = pad).
+    mask = (torch.rand(batch_size, 1, max_particles, device=device) > 0.3).float()
 
-checkpoint_callback = pl.callbacks.ModelCheckpoint(
-    monitor='val_loss',
-    dirpath='/content/drive/MyDrive/JetClass/models',
-    filename='best-model-{epoch:02d}-{val_loss:.2f}',
-    save_top_k=1,  # Save the best model
-    mode='min',    # 'min' or 'max' depending on the metric to monitor
-)
+    with torch.no_grad():
+        logits = model(x, mask=mask)
 
-# Define EarlyStopping callback
-early_stop_callback = pl.callbacks.EarlyStopping(
-    monitor='val_loss',  # Monitor validation loss for early stopping
-    patience=2,          # Number of epochs with no improvement after which training will be stopped
-    min_delta=1e-2,
-    mode='min',          # 'min' or 'max' depending on the metric to monitor
-)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"[smoke-test] device={device}  n_params={n_params:,}")
+    print(f"[smoke-test] input x={tuple(x.shape)}  mask={tuple(mask.shape)}")
+    print(f"[smoke-test] output logits={tuple(logits.shape)}")
 
-trainer = pl.Trainer(max_epochs=EPOCHS, default_root_dir=log_dir, logger=light_model.logg,
-                      callbacks=[checkpoint_callback, early_stop_callback])
-trainer.fit(light_model, train_dataloader, val_dataloader)
+    assert logits.shape == (batch_size, num_classes), (
+        f"expected output shape {(batch_size, num_classes)}, got {tuple(logits.shape)}"
+    )
+    assert torch.isfinite(logits).all(), "model produced non-finite logits"
 
-# At this point the original notebook launched:
-#   %tensorboard --logdir=/content/drive/MyDrive/JetClass/logs/lightning_logs --port=6005
-# to monitor training curves live. The extraction this script was
-# reconstructed from is truncated shortly after this point (mid-first-epoch
-# sanity checking / validation steps), so no final test_step metrics
-# (test_acc / test_roc / test_rejection_score_*) are available in the
-# source -- see README.md "Results" for details. To obtain them, run:
-#
-# trainer.test(light_model, test_dataloader)
+    print("[smoke-test] OK: model instantiates and a forward pass "
+          "produces finite logits of the expected shape.")
+    return logits
+
+
+# ==========================================================================
+# 7. CLI entry point
+# ==========================================================================
+def build_arg_parser():
+    parser = argparse.ArgumentParser(
+        description="Particle Transformer (ParT) for JetClass jet tagging.")
+    parser.add_argument(
+        '--mode', choices=['smoke-test', 'download-example', 'build-dataset', 'train'],
+        default='smoke-test',
+        help="smoke-test (default): instantiate the model and run a forward pass on "
+             "random dummy tensors, no dataset required. download-example: fetch and "
+             "inspect the small 100k-jet JetClass example file. build-dataset: subsample "
+             "and cache a training set from local JetClass ROOT files. train: train on a "
+             "previously built/cached dataset.")
+
+    parser.add_argument('--data-dir', default='data/JetClass',
+                         help="Root directory for JetClass data (default: data/JetClass).")
+    parser.add_argument('--root-glob-pattern', default=None,
+                         help="Glob pattern for raw per-class training ROOT files "
+                              "(default: '<data-dir>/train_100M/*.root').")
+    parser.add_argument('--cache-path', default=None,
+                         help="Path to the cached (gzip-pickled) training dataset "
+                              "(default: '<data-dir>/JetClass_subset.pkl.gz').")
+    parser.add_argument('--stride', type=int, default=30,
+                         help="Use every Nth sorted ROOT file when building the dataset "
+                              "(default: 30, i.e. ~1/30th of the 100M-jet training set).")
+    parser.add_argument('--max-particles', type=int, default=128,
+                         help="Zero-pad/truncate each jet to this many constituents (default: 128).")
+
+    parser.add_argument('--log-dir', default='logs', help="TensorBoard log directory.")
+    parser.add_argument('--checkpoint-dir', default='checkpoints', help="Model checkpoint directory.")
+    parser.add_argument('--batch-size', type=int, default=512)
+    parser.add_argument('--epochs', type=int, default=15)
+    parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--num-workers', type=int, default=4)
+    parser.add_argument('--accelerator', default='auto',
+                         help="Passed to pytorch_lightning.Trainer (e.g. 'cpu', 'gpu', 'mps', 'auto').")
+    parser.add_argument('--run-test', action='store_true',
+                         help="After training, also run trainer.test() on the held-out test split.")
+    parser.add_argument('--seed', type=int, default=42)
+    return parser
+
+
+def main(argv=None):
+    args = build_arg_parser().parse_args(argv)
+    pl.seed_everything(args.seed, workers=True)
+
+    root_glob_pattern = args.root_glob_pattern or os.path.join(args.data_dir, 'train_100M', '*.root')
+    cache_path = args.cache_path or os.path.join(args.data_dir, 'JetClass_subset.pkl.gz')
+
+    if args.mode == 'smoke-test':
+        run_smoke_test(max_particles=args.max_particles)
+        return
+
+    if args.mode == 'download-example':
+        download_and_explore_example(args.data_dir)
+        return
+
+    if args.mode == 'build-dataset':
+        build_training_dataset(root_glob_pattern, cache_path,
+                                 stride=args.stride, max_particles=args.max_particles)
+        return
+
+    # args.mode == 'train'
+    if not os.path.exists(cache_path):
+        raise FileNotFoundError(
+            f"No cached dataset found at '{cache_path}'. Run with --mode build-dataset "
+            "first (see README.md 'Getting the dataset' for how to obtain the raw "
+            "JetClass ROOT files)."
+        )
+
+    splits = load_dataset_splits(cache_path, seed=args.seed)
+    X_train, y_train, train_mask = splits["train"]
+    X_val, y_val, val_mask = splits["val"]
+
+    train_loader = DataLoader(JetTensorDataset(X_train, y_train, train_mask),
+                               batch_size=args.batch_size, shuffle=True,
+                               num_workers=args.num_workers)
+    val_loader = DataLoader(JetTensorDataset(X_val, y_val, val_mask),
+                             batch_size=args.batch_size, shuffle=False,
+                             num_workers=args.num_workers)
+
+    model = build_model()
+    lightning_module = JetTaggingLightningModule(model, log_dir=args.log_dir, lr=args.lr)
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+    checkpoint_callback = pl.callbacks.ModelCheckpoint(
+        monitor='val_loss',
+        dirpath=args.checkpoint_dir,
+        filename='best-model-{epoch:02d}-{val_loss:.2f}',
+        save_top_k=1,
+        mode='min',
+    )
+    early_stop_callback = pl.callbacks.EarlyStopping(
+        monitor='val_loss',
+        patience=2,
+        min_delta=1e-2,
+        mode='min',
+    )
+
+    trainer = pl.Trainer(
+        max_epochs=args.epochs,
+        default_root_dir=args.log_dir,
+        logger=lightning_module.tb_logger,
+        accelerator=args.accelerator,
+        callbacks=[checkpoint_callback, early_stop_callback],
+    )
+    trainer.fit(lightning_module, train_loader, val_loader)
+
+    if args.run_test:
+        X_test, y_test, test_mask = splits["test"]
+        test_loader = DataLoader(JetTensorDataset(X_test, y_test, test_mask),
+                                  batch_size=args.batch_size, shuffle=False,
+                                  num_workers=args.num_workers)
+        trainer.test(lightning_module, test_loader)
+
+
+if __name__ == "__main__":
+    main()
